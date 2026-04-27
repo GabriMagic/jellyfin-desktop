@@ -59,6 +59,16 @@ struct X11State {
     int about_buf_idx = 0;
     bool about_visible = false;
 
+    // Popup child window (CEF OSR <select> dropdowns, above cef_window)
+    xcb_window_t popup_window = XCB_NONE;
+    ShmBuffer popup_bufs[2];
+    int popup_buf_idx = 0;
+    xcb_gcontext_t popup_gc = XCB_NONE;
+    bool popup_visible = false;
+    // Logical position/size from popup_show; physical size from present_software.
+    int popup_x = 0, popup_y = 0;
+    int popup_pw = 0, popup_ph = 0;
+
     // Graphics contexts (one per child window, reused across frames)
     xcb_gcontext_t cef_gc = XCB_NONE;
     xcb_gcontext_t overlay_gc = XCB_NONE;
@@ -162,6 +172,16 @@ static void sync_overlay_positions() {
         xcb_configure_window(g_x11.conn, g_x11.overlay_window, mask, vals);
     if (g_x11.about_window != XCB_NONE && g_x11.about_visible)
         xcb_configure_window(g_x11.conn, g_x11.about_window, mask, vals);
+    if (g_x11.popup_window != XCB_NONE && g_x11.popup_visible) {
+        float scale = g_x11.cached_scale > 0 ? g_x11.cached_scale : 1.0f;
+        uint32_t popup_vals[4] = {
+            static_cast<uint32_t>(px + static_cast<int>(g_x11.popup_x * scale)),
+            static_cast<uint32_t>(py + static_cast<int>(g_x11.popup_y * scale)),
+            static_cast<uint32_t>(g_x11.popup_pw),
+            static_cast<uint32_t>(g_x11.popup_ph)
+        };
+        xcb_configure_window(g_x11.conn, g_x11.popup_window, mask, popup_vals);
+    }
     xcb_flush(g_x11.conn);
 }
 
@@ -216,6 +236,8 @@ static void shm_free(ShmBuffer& buf, xcb_connection_t* conn) {
 // =====================================================================
 
 static void hide_overlays_locked() {
+    if (g_x11.popup_window != XCB_NONE)
+        xcb_unmap_window(g_x11.conn, g_x11.popup_window);
     if (g_x11.about_window != XCB_NONE)
         xcb_unmap_window(g_x11.conn, g_x11.about_window);
     if (g_x11.overlay_window != XCB_NONE)
@@ -397,6 +419,70 @@ static void x11_set_about_visible(bool visible) {
         if (main) main->GetHost()->SetFocus(false);
         if (ovl)  ovl->GetHost()->SetFocus(false);
     }
+}
+
+// =====================================================================
+// Popup window (CEF OSR <select> dropdowns)
+// =====================================================================
+
+static void x11_popup_show(int x, int y, int /*lw*/, int /*lh*/) {
+    std::lock_guard<std::mutex> lock(g_x11.surface_mtx);
+    g_x11.popup_x = x;
+    g_x11.popup_y = y;
+    g_x11.popup_visible = true;
+    // The window is mapped and sized on the first present_software call,
+    // when the physical buffer dimensions are known.
+}
+
+static void x11_popup_hide() {
+    std::lock_guard<std::mutex> lock(g_x11.surface_mtx);
+    g_x11.popup_visible = false;
+    if (g_x11.popup_window != XCB_NONE) {
+        xcb_unmap_window(g_x11.conn, g_x11.popup_window);
+        xcb_flush(g_x11.conn);
+    }
+    g_x11.popup_pw = 0;
+    g_x11.popup_ph = 0;
+}
+
+static void x11_popup_present_software(const void* buffer, int pw, int ph,
+                                       int /*lw*/, int /*lh*/) {
+    if (g_shutting_down.load(std::memory_order_relaxed)) return;
+    if (pw <= 0 || ph <= 0) return;
+
+    std::lock_guard<std::mutex> lock(g_x11.surface_mtx);
+    if (g_x11.popup_window == XCB_NONE || !g_x11.popup_visible) return;
+
+    // On first call (or size change), configure and map the popup window.
+    // popup_x/popup_y are logical pixels from OnPopupSize; convert to physical.
+    if (pw != g_x11.popup_pw || ph != g_x11.popup_ph) {
+        g_x11.popup_pw = pw;
+        g_x11.popup_ph = ph;
+        float scale = g_x11.cached_scale > 0 ? g_x11.cached_scale : 1.0f;
+        int wx = g_x11.parent_x + static_cast<int>(g_x11.popup_x * scale);
+        int wy = g_x11.parent_y + static_cast<int>(g_x11.popup_y * scale);
+        uint32_t vals[4] = {
+            static_cast<uint32_t>(wx), static_cast<uint32_t>(wy),
+            static_cast<uint32_t>(pw), static_cast<uint32_t>(ph)
+        };
+        xcb_configure_window(g_x11.conn, g_x11.popup_window,
+            XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+            XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, vals);
+        xcb_map_window(g_x11.conn, g_x11.popup_window);
+    }
+
+    auto& buf = g_x11.popup_bufs[g_x11.popup_buf_idx];
+    if (!shm_alloc(buf, g_x11.conn, pw, ph)) return;
+
+    memcpy(buf.data, buffer, static_cast<size_t>(pw) * ph * 4);
+    xcb_shm_put_image(g_x11.conn, g_x11.popup_window, g_x11.popup_gc,
+        pw, ph, 0, 0, pw, ph,
+        0, 0, g_x11.argb_depth,
+        XCB_IMAGE_FORMAT_Z_PIXMAP,
+        0, buf.seg, 0);
+
+    g_x11.popup_buf_idx ^= 1;
+    xcb_flush(g_x11.conn);
 }
 
 // =====================================================================
@@ -637,6 +723,12 @@ static bool x11_init(mpv_handle*) {
     g_x11.about_gc = xcb_generate_id(g_x11.conn);
     xcb_create_gc(g_x11.conn, g_x11.about_gc, g_x11.about_window, 0, nullptr);
 
+    // Popup window (CEF OSR <select> dropdowns, above cef_window; initially unmapped)
+    // Created with a 1x1 placeholder size; resized on first present_software call.
+    g_x11.popup_window = create_overlay_window(px, py, 1, 1);
+    g_x11.popup_gc = xcb_generate_id(g_x11.conn);
+    xcb_create_gc(g_x11.conn, g_x11.popup_gc, g_x11.popup_window, 0, nullptr);
+
     xcb_flush(g_x11.conn);
 
     // Note: input::x11::init already selects StructureNotify + input events
@@ -667,6 +759,8 @@ static bool x11_init(mpv_handle*) {
 static void x11_cleanup() {
     // Hide overlay windows immediately so they don't linger during shutdown
     if (g_x11.conn) {
+        if (g_x11.popup_window != XCB_NONE)
+            xcb_unmap_window(g_x11.conn, g_x11.popup_window);
         if (g_x11.about_window != XCB_NONE)
             xcb_unmap_window(g_x11.conn, g_x11.about_window);
         if (g_x11.overlay_window != XCB_NONE)
@@ -683,8 +777,13 @@ static void x11_cleanup() {
     for (auto& buf : g_x11.cef_bufs)     shm_free(buf, g_x11.conn);
     for (auto& buf : g_x11.overlay_bufs)  shm_free(buf, g_x11.conn);
     for (auto& buf : g_x11.about_bufs)    shm_free(buf, g_x11.conn);
+    for (auto& buf : g_x11.popup_bufs)    shm_free(buf, g_x11.conn);
 
     // Free GCs and destroy windows
+    if (g_x11.popup_gc != XCB_NONE)
+        xcb_free_gc(g_x11.conn, g_x11.popup_gc);
+    if (g_x11.popup_window != XCB_NONE)
+        xcb_destroy_window(g_x11.conn, g_x11.popup_window);
     if (g_x11.about_gc != XCB_NONE)
         xcb_free_gc(g_x11.conn, g_x11.about_gc);
     if (g_x11.about_window != XCB_NONE)
@@ -727,10 +826,10 @@ Platform make_x11_platform() {
         .about_present_software = x11_about_present_software,
         .about_resize = x11_about_resize,
         .set_about_visible = x11_set_about_visible,
-        .popup_show = [](int, int, int, int) {},
-        .popup_hide = []() {},
+        .popup_show = x11_popup_show,
+        .popup_hide = x11_popup_hide,
         .popup_present = [](const CefAcceleratedPaintInfo&, int, int) {},
-        .popup_present_software = [](const void*, int, int, int, int) {},
+        .popup_present_software = x11_popup_present_software,
         .try_native_popup_menu = [](int, int, int, int,
                                     const std::vector<std::string>&, int,
                                     std::function<void(int)>) { return false; },

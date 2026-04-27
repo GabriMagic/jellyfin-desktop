@@ -169,9 +169,21 @@ void CefLayer::OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rect) {
 }
 
 void CefLayer::try_show_popup() {
-    if (!popup_visible_ || !popup_size_received_ || !popup_options_received_)
+    if (!popup_visible_ || !popup_size_received_)
         return;
 
+    // Enable the compositor subsurface immediately so that OnPaint(PET_POPUP)
+    // calls arriving before popupOptions returns from the renderer are not
+    // discarded. On macOS popup_show is a no-op; on Wayland/X11 it arms the
+    // subsurface/window. Calling this a second time (when options arrive) is
+    // harmless — it just re-confirms the position.
+    g_platform.popup_show(popup_rect_.x, popup_rect_.y,
+                          popup_rect_.width, popup_rect_.height);
+
+    if (!popup_options_received_)
+        return;  // Options IPC still in flight; subsurface armed, paints will land.
+
+    // Options are ready — try to upgrade to a native menu if available.
     if (!popup_options_.empty() && g_platform.try_native_popup_menu) {
         CefRefPtr<CefLayer> self = this;
         auto on_selected = [self](int index) {
@@ -184,12 +196,12 @@ void CefLayer::try_show_popup() {
                 popup_rect_.width, popup_rect_.height,
                 popup_options_, popup_selected_idx_,
                 std::move(on_selected))) {
+            // Native menu shown (macOS). popup_show is a no-op there, so there
+            // is nothing to hide.
             return;
         }
     }
-
-    g_platform.popup_show(popup_rect_.x, popup_rect_.y,
-                          popup_rect_.width, popup_rect_.height);
+    // Compositor path: subsurface already armed by popup_show above.
 }
 
 void CefLayer::dispatch_popup_selection(int index) {
